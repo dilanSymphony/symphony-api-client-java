@@ -3,6 +3,7 @@ package it.clients.symphony.api;
 import clients.symphony.api.MessagesClient;
 import clients.symphony.api.constants.AgentConstants;
 import clients.symphony.api.constants.PodConstants;
+import exceptions.DataLossPreventionException;
 import it.commons.BotTest;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +24,43 @@ public class MessagesClientTest extends BotTest {
   @Before
   public void initClient() {
     messagesClient = new MessagesClient(symBotClient);
+  }
+
+  @Test
+  public void getMessageByIdSuccess() {
+    stubFor(get(urlEqualTo(AgentConstants.GETMESSAGEBYID.replace("{mid}", "mock-message_id")))
+        .withHeader(HttpHeaders.ACCEPT, equalTo(MediaType.APPLICATION_JSON))
+        .willReturn(aResponse()
+            .withStatus(200)
+            .withHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON)
+            .withBody("{\n" +
+                "  \"messageId\": \"mockMessageId\",\n" +
+                "  \"timestamp\": 1590130725008,\n" +
+                "  \"message\": \"<div data-format=\\\"PresentationML\\\" data-version=\\\"2.0\\\" class=\\\"wysiwyg\\\"><p>Hello</p></div>\",\n" +
+                "  \"data\": \"{}\",\n" +
+                "  \"user\": {\n" +
+                "    \"userId\": 12345678901234,\n" +
+                "    \"firstName\": \"Mock\",\n" +
+                "    \"lastName\": \"User\",\n" +
+                "    \"displayName\": \"Mock User\",\n" +
+                "    \"email\": \"mock.user@symphony.com\"\n" +
+                "  },\n" +
+                "  \"stream\": {\n" +
+                "    \"streamId\": \"mock_stream_id\",\n" +
+                "    \"streamType\": \"IM\"\n" +
+                "  },\n" +
+                "  \"userAgent\": \"DESKTOP-40.0.0-11751-Windows-10-Chrome-81.0.4044.138\",\n" +
+                "  \"originalFormat\": \"com.symphony.messageml.v2\",\n" +
+                "  \"disclaimer\": \"This is mock disclaimer\",\n" +
+                "  \"sid\": \"mock_sid\"\n" +
+                "}")));
+
+    InboundMessage message = messagesClient.getMessageById("mock+message/id");
+
+    assertNotNull(message);
+    assertEquals("mockMessageId", message.getMessageId());
+    assertEquals("This is mock disclaimer", message.getDisclaimer());
+    assertEquals("mock_sid", message.getSid());
   }
 
   @Test
@@ -83,6 +121,79 @@ public class MessagesClientTest extends BotTest {
 
     assertNotNull(attachment);
   }
+
+  @Test
+  public void sendMessageSuccess() {
+      String message = "hello";
+      stubFor(
+          post(urlEqualTo(AgentConstants.CREATEMESSAGE.replace("{sid}", "1")))
+              .withHeader(HttpHeaders.ACCEPT, equalTo(MediaType.APPLICATION_JSON))
+              .willReturn(
+                  aResponse()
+                      .withStatus(200)
+                      .withHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON)
+                      .withBody("{\n" +
+                          "    \"messageId\": \"1\",\n" +
+                          "    \"timestamp\": 1579588917149,\n" +
+                          "    \"message\": \"<div data-format=\\\"PresentationML\\\" data-version=\\\"2.0\\\">" + message + "</div>\"," +
+                          "    \"user\": {\n" +
+                          "        \"userId\": 1,\n" +
+                          "        \"displayName\": \"Bot\",\n" +
+                          "        \"email\": \"bot@symphony.com\",\n" +
+                          "        \"username\": \"bot\"\n" +
+                          "    },\n" +
+                          "    \"stream\": {\n" +
+                          "        \"streamId\": \"1\",\n" +
+                          "        \"streamType\": \"IM\"\n" +
+                          "    },\n" +
+                          "    \"originalFormat\": \"com.symphony.messageml.v2\"\n" +
+                          "}")
+              )
+      );
+
+      OutboundMessage outboundMessage = new OutboundMessage(message);
+      InboundMessage inboundMessage = messagesClient.sendMessage("1", outboundMessage);
+
+      assertEquals(message, inboundMessage.getMessageText());
+  }
+
+    @Test(expected = DataLossPreventionException.class)
+    public void sendMessageBlockedByDLP() {
+        String message = "bake";
+        stubFor(
+            post(urlEqualTo(AgentConstants.CREATEMESSAGE.replace("{sid}", "1")))
+                .withHeader(HttpHeaders.ACCEPT, equalTo(MediaType.APPLICATION_JSON))
+                .willReturn(
+                    aResponse()
+                        .withStatus(451)
+                        .withHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON)
+                        .withBody("{\n" +
+                            "    \"code\": 451,\n" +
+                            "    \"message\": \"Compliance issues found in message\",\n" +
+                            "    \"details\": [\n" +
+                            "        {\n" +
+                            "            \"detectionIn\": \"TEXT\",\n" +
+                            "            \"policyResults\": [\n" +
+                            "                {\n" +
+                            "                    \"name\": \"Cooking Policy\",\n" +
+                            "                    \"status\": \"WARN\",\n" +
+                            "                    \"scopes\": [\n" +
+                            "                        \"INTERNAL\",\n" +
+                            "                        \"EXTERNAL\"\n" +
+                            "                    ],\n" +
+                            "                    \"reasons\": [\n" +
+                            "                        \"bake\"\n" +
+                            "                    ]\n" +
+                            "                }\n" +
+                            "            ]\n" +
+                            "        }\n" +
+                            "    ]\n" +
+                            "}")
+                )
+        );
+
+        messagesClient.sendMessage("1", new OutboundMessage(message));
+    }
 
   @Test
   public void getMessageStatusSuccess() {

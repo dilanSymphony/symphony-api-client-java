@@ -1,59 +1,66 @@
 package authentication;
 
+import static internal.jersey.JerseyHelper.isNotSuccess;
+import static internal.jersey.JerseyHelper.isSuccess;
+
 import clients.symphony.api.APIClient;
 import clients.symphony.api.constants.CommonConstants;
 import configuration.SymConfig;
-import java.io.*;
-import java.security.GeneralSecurityException;
-import java.security.PrivateKey;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-import javax.ws.rs.client.Client;
-import javax.ws.rs.client.ClientBuilder;
-import javax.ws.rs.client.Entity;
-import javax.ws.rs.core.MediaType;
-import javax.ws.rs.core.Response;
+import exceptions.AuthenticationException;
+import internal.FileHelper;
+import internal.jersey.JerseyHelper;
+import io.github.resilience4j.core.IntervalFunction;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+import io.github.resilience4j.retry.RetryRegistry;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
 import model.Token;
 import org.glassfish.jersey.client.ClientConfig;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import utils.HttpClientBuilderHelper;
 import utils.JwtHelper;
 
+import java.io.IOException;
+import java.security.GeneralSecurityException;
+import java.security.PrivateKey;
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeoutException;
+
+import javax.ws.rs.ProcessingException;
+import javax.ws.rs.client.Client;
+import javax.ws.rs.client.ClientBuilder;
+import javax.ws.rs.client.Entity;
+import javax.ws.rs.client.Invocation;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+import javax.xml.ws.WebServiceException;
+
+@Slf4j
 public class SymBotRSAAuth extends APIClient implements ISymAuth {
-    private final Logger logger = LoggerFactory.getLogger(SymBotRSAAuth.class);
+
+    private final SymConfig config;
+    private final Client sessionAuthClient;
+    private final Client kmAuthClient;
+
     private String sessionToken;
     private String kmToken;
-    private SymConfig config;
-    private Client sessionAuthClient;
-    private Client kmAuthClient;
     private String jwt;
-    private long lastAuthTime = 0;
-    private int authRetries = 0;
 
     public SymBotRSAAuth(SymConfig config) {
-        this.config = config;
-        ClientBuilder clientBuilder = HttpClientBuilderHelper.getHttpClientBuilderWithTruststore(config);
-        Client client = clientBuilder.build();
-
-        this.sessionAuthClient = client;
-        this.kmAuthClient = client;
-
-        ClientConfig clientConfig = HttpClientBuilderHelper.getPodClientConfig(config);
-        if (clientConfig != null) {
-            this.sessionAuthClient = clientBuilder.withConfig(clientConfig).build();
-        }
-
-        ClientConfig kmClientConfig = HttpClientBuilderHelper.getKMClientConfig(config);
-        if (kmClientConfig != null) {
-            this.kmAuthClient = clientBuilder.withConfig(kmClientConfig).build();
-        }
+        this(
+            config,
+            HttpClientBuilderHelper.getPodClientConfig(config),
+            HttpClientBuilderHelper.getKMClientConfig(config)
+        );
     }
 
     public SymBotRSAAuth(SymConfig config, ClientConfig sessionAuthClientConfig, ClientConfig kmAuthClientConfig) {
         this.config = config;
-        ClientBuilder clientBuilder = HttpClientBuilderHelper.getHttpClientBuilderWithTruststore(config);
+        final ClientBuilder clientBuilder = HttpClientBuilderHelper.getHttpClientBuilderWithTruststore(config);
         if (sessionAuthClientConfig != null) {
             this.sessionAuthClient = clientBuilder.withConfig(sessionAuthClientConfig).build();
         } else {
@@ -67,101 +74,55 @@ public class SymBotRSAAuth extends APIClient implements ISymAuth {
     }
 
     @Override
-    public void authenticate() {
-        PrivateKey privateKey = null;
-        try {
-            privateKey = JwtHelper.parseRSAPrivateKey(this.getRSAPrivateKeyFile(this.config));
-        } catch (IOException | GeneralSecurityException e) {
-            logger.error("Error trying to parse RSA private key", e);
-        }
-        if (lastAuthTime == 0 | System.currentTimeMillis() - lastAuthTime > 3000) {
-            logger.info("Last auth time was {}", lastAuthTime);
-            logger.info("Now is {}", System.currentTimeMillis());
-            jwt = JwtHelper.createSignedJwt(config.getBotUsername(), AuthEndpointConstants.JWT_EXPIRY_MS, privateKey);
-            sessionAuthenticate();
-            kmAuthenticate();
-            lastAuthTime = System.currentTimeMillis();
-        } else {
-            try {
-                logger.info("Re-authenticated too fast. Wait 30 seconds to try again.");
-                TimeUnit.SECONDS.sleep(AuthEndpointConstants.TIMEOUT);
-                authenticate();
-            } catch (InterruptedException e) {
-                logger.error("Error with authentication", e);
-            }
-        }
-    }
+    @SneakyThrows
+    public void authenticate() throws AuthenticationException {
 
-    protected InputStream getRSAPrivateKeyFile(final SymConfig config) throws FileNotFoundException {
-        final String dirPath = config.getBotPrivateKeyPath();
-        final String keyName = config.getBotPrivateKeyName();
-        final String path = dirPath + (dirPath.endsWith(File.separator) ? "" : File.separator) + keyName;
-        if (path.startsWith("classpath:")) {
-            return this.getClass().getResourceAsStream(path.replace("classpath:", ""));
-        }
-        return new FileInputStream(path);
+        this.refreshJwt();
+
+        logger.debug("RSA authentication with {}", this.config.getRetry());
+        final RetryConfig config = RetryConfig.custom()
+            .maxAttempts(this.config.getRetry().getMaxAttempts())
+            .intervalFunction(IntervalFunction.ofExponentialBackoff(
+                this.config.getRetry().getInitialIntervalMillis(),
+                this.config.getRetry().getMultiplier()
+            ))
+            .build();
+
+        final RetryRegistry registry = RetryRegistry.of(config);
+
+        registry.retry("Session auth").executeCheckedSupplier(() -> {
+            this.sessionAuthenticate();
+            return null;
+        });
+
+        registry.retry("KeyManager auth").executeCheckedSupplier(() -> {
+            this.kmAuthenticate();
+            return null;
+        });
     }
 
     @Override
-    public void sessionAuthenticate() {
-        Map<String, String> token = new HashMap<>();
-        token.put("token", jwt);
-        String podTarget = CommonConstants.HTTPS_PREFIX + config.getPodHost() + ":" + config.getPodPort();
-        Response response = this.sessionAuthClient.target(podTarget)
-            .path(AuthEndpointConstants.SESSION_AUTH_PATH_RSA)
-            .request(MediaType.APPLICATION_JSON)
-            .post(Entity.entity(token, MediaType.APPLICATION_JSON));
-
-        if (response.getStatusInfo().getFamily() != Response.Status.Family.SUCCESSFUL) {
-            try {
-                handleError(response, null);
-            } catch (Exception e) {
-                logger.error("Unexpected error, retry authentication in 30 seconds");
-            }
-            try {
-                TimeUnit.SECONDS.sleep(AuthEndpointConstants.TIMEOUT);
-            } catch (InterruptedException e) {
-                logger.error("Error with authentication", e);
-            }
-            if (authRetries++ > AuthEndpointConstants.MAX_AUTH_RETRY) {
-                logger.error("Max retries reached. Giving up on auth.");
-                return;
-            }
-            sessionAuthenticate();
-        } else {
-            sessionToken = response.readEntity(Token.class).getToken();
-        }
+    public void sessionAuthenticate() throws AuthenticationException {
+        logger.debug("Starting session authentication...");
+        this.sessionToken = this.doRsaAuth(
+            this.sessionAuthClient,
+            this.config.getPodUrl(),
+            AuthEndpointConstants.SESSION_AUTH_PATH_RSA,
+            this.jwt
+        );
+        logger.debug("Session token successfully retrieved !");
     }
 
     @Override
-    public void kmAuthenticate() {
-        Map<String, String> token = new HashMap<>();
-        token.put("token", jwt);
-        String keyAuthTarget = CommonConstants.HTTPS_PREFIX + config.getKeyAuthHost() + ":" + config.getKeyAuthPort();
-        Response response = this.kmAuthClient.target(keyAuthTarget)
-            .path(AuthEndpointConstants.KEY_AUTH_PATH_RSA)
-            .request(MediaType.APPLICATION_JSON)
-            .post(Entity.entity(token, MediaType.APPLICATION_JSON));
-
-        if (response.getStatusInfo().getFamily() != Response.Status.Family.SUCCESSFUL) {
-            try {
-                handleError(response, null);
-            } catch (Exception e) {
-                logger.error("Unexpected error, retry authentication in 30 seconds");
-            }
-            try {
-                TimeUnit.SECONDS.sleep(AuthEndpointConstants.TIMEOUT);
-            } catch (InterruptedException e) {
-                logger.error("Error with authentication", e);
-            }
-            if (authRetries++ > AuthEndpointConstants.MAX_AUTH_RETRY) {
-                logger.error("Max retries reached. Giving up on auth.");
-                return;
-            }
-            kmAuthenticate();
-        } else {
-            kmToken = response.readEntity(Token.class).getToken();
-        }
+    public void kmAuthenticate() throws AuthenticationException {
+        logger.debug("Starting KM authentication...");
+        this.kmToken = this.doRsaAuth(
+            this.kmAuthClient,
+            this.config.getKeyAuthUrl(),
+            AuthEndpointConstants.KEY_AUTH_PATH_RSA,
+            this.jwt
+        );
+        logger.debug("KM token successfully retrieved !");
     }
 
     @Override
@@ -186,23 +147,45 @@ public class SymBotRSAAuth extends APIClient implements ISymAuth {
 
     @Override
     public void logout() {
-        logger.info("Logging out");
-        Client client = ClientBuilder.newClient();
-        String sessionAuthTarget = CommonConstants.HTTPS_PREFIX + config.getSessionAuthHost()
-            + ":" + config.getSessionAuthPort();
-        Response response = client.target(sessionAuthTarget)
-            .path(AuthEndpointConstants.LOGOUT_PATH)
-            .request(MediaType.APPLICATION_JSON)
-            .header("sessionToken", getSessionToken())
-            .post(null);
+        logger.warn("Logout is not needed for RSA authentication.");
+    }
 
-        if (response.getStatusInfo().getFamily()
-            != Response.Status.Family.SUCCESSFUL) {
-            try {
-                handleError(response, null);
-            } catch (Exception e) {
-                logger.error("Unexpected error, retry logout in 30 seconds", e);
+    public String doRsaAuth(Client client, String target, String path, String jwt) throws AuthenticationException {
+
+        final Token payload = new Token();
+        payload.setToken(jwt);
+
+        final Invocation.Builder builder = client.target(target).path(path).request(MediaType.APPLICATION_JSON);
+
+        try (final Response response = builder.post(Entity.entity(payload, MediaType.APPLICATION_JSON))) {
+            if (isNotSuccess(response)) {
+
+                if(response.getStatus() == 401) {
+                    logger.warn("JWT has expired, it will be refreshed before retry.");
+                    // the JWT has expired, let's refresh it before retry
+                    this.refreshJwt();
+                }
+
+                final String responsePayload = JerseyHelper.read(response, String.class);
+                throw new AuthenticationException(responsePayload);
+            } else {
+                return JerseyHelper.read(response, Token.class).getToken();
             }
+        } catch (ProcessingException ex) {
+            logger.error("Unable to process RSA authentication request.", ex);
+            throw new AuthenticationException(ex);
+        }
+    }
+
+    private void refreshJwt() throws AuthenticationException {
+        try {
+            final String privateKeyPath = FileHelper.path(this.config.getBotPrivateKeyPath(), this.config.getBotPrivateKeyName());
+            final PrivateKey privateKey = JwtHelper.parseRSAPrivateKey(FileHelper.readFile(privateKeyPath));
+            this.jwt = JwtHelper.createSignedJwt(this.config.getBotUsername(), AuthEndpointConstants.JWT_EXPIRY_MS, privateKey);
+            logger.debug("JWT successfully refresh for RSA authentication");
+        } catch (IOException | GeneralSecurityException ex) {
+            logger.error("Something went wrong while refreshing JWT, see cause below:", ex);
+            throw new AuthenticationException(ex);
         }
     }
 }

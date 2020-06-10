@@ -1,41 +1,37 @@
 package configuration;
 
+import static utils.HttpClientBuilderHelper.getHttpClientBuilderWithTruststore;
+
 import clients.symphony.api.constants.AgentConstants;
 import clients.symphony.api.constants.CommonConstants;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import model.AgentInfo;
+import org.apache.commons.beanutils.BeanUtils;
+
+import java.lang.reflect.InvocationTargetException;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
-import javax.ws.rs.client.Client;
+
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import model.FqdnHost;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import utils.HttpClientBuilderHelper;
 
+@Slf4j
+@Getter
+@Setter
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class SymLoadBalancedConfig extends SymConfig {
-    private int currentAgentIndex = -1;
-    private String actualAgentHost;
+
     private LoadBalancing loadBalancing;
-    private List<String> agentServers;
-    private static final Logger logger = LoggerFactory.getLogger(SymLoadBalancedConfig.class);
+    private List<String> agentServers = Collections.emptyList();
 
-    public LoadBalancing getLoadBalancing() {
-        return loadBalancing;
-    }
+    private int currentAgentIndex = -1;
 
-    public void setLoadBalancing(LoadBalancing loadBalancing) {
-        this.loadBalancing = loadBalancing;
-    }
-
-    public List<String> getAgentServers() {
-        return agentServers;
-    }
-
-    public void setAgentServers(List<String> agentServers) {
-        this.agentServers = agentServers;
-    }
+    private String actualAgentHost = null;
+    private int actualAgentPort = -1;
 
     @Override
     public String getAgentHost() {
@@ -69,12 +65,13 @@ public class SymLoadBalancedConfig extends SymConfig {
 
             default:
         }
+
         return super.getAgentHost();
     }
 
     public void rotateAgent() {
         String newAgent = null;
-        switch (loadBalancing.getMethod()) {
+        switch (this.loadBalancing.getMethod()) {
             case random:
                 currentAgentIndex = ThreadLocalRandom.current().nextInt(0, agentServers.size());
                 newAgent = agentServers.get(currentAgentIndex);
@@ -94,70 +91,35 @@ public class SymLoadBalancedConfig extends SymConfig {
         logger.info("Agent rotated to: {}", newAgent);
     }
 
-    @Override
-    public int getAgentPort() {
-        return super.getAgentPort();
-    }
+    /**
+     * Retrieves actual Agent FQDN (Fully Qualified Domain Name) by calling /agent/v1/info endpoint.
+     * @return actual Agent host
+     */
+    protected String getActualAgentHost() {
 
-    private String getActualAgentHost() {
-        String externalAgentHost = (agentServers != null && agentServers.size() > 0) ?
-            agentServers.get(0) : getAgentHost();
+        // using "super" to ensure that we retrieve fqdn through the LB
+        final String uri = CommonConstants.HTTPS_PREFIX + super.getAgentHost() + ":" + super.getAgentPort();
 
-        Client client = HttpClientBuilderHelper.getHttpClientBuilderWithTruststore(this).build();
-
-        Response response
-            = client.target(CommonConstants.HTTPS_PREFIX
-            + externalAgentHost
-            + ":" + getAgentPort())
-            .path(AgentConstants.GETHOST)
+        final Response response = getHttpClientBuilderWithTruststore(this).build().target(uri)
+            .path(AgentConstants.INFO)
             .request(MediaType.APPLICATION_JSON)
             .get();
 
         if (response.getStatusInfo().getFamily() != Response.Status.Family.SUCCESSFUL) {
-            logger.error("Unable to get actual hostname");
+            logger.error("Unable to get actual Agent hostname, cause : {}", response);
             return null;
         } else {
-            return response.readEntity(FqdnHost.class).getServerFqdn();
+            final String agentServerFqdn = response.readEntity(AgentInfo.class).getServerFqdn();
+            logger.debug("Agent FQDN={}", agentServerFqdn);
+            return agentServerFqdn;
         }
     }
 
     public void cloneAttributes(SymConfig config) {
-        this.setSessionAuthHost(config.getSessionAuthHost());
-        this.setSessionAuthPort(config.getSessionAuthPort());
-        this.setKeyAuthHost(config.getKeyAuthHost());
-        this.setKeyAuthPort(config.getKeyAuthPort());
-        this.setPodHost(config.getPodHost());
-        this.setPodPort(config.getPodPort());
-        this.setAgentHost(config.getAgentHost());
-        this.setAgentPort(config.getAgentPort());
-        this.setBotCertPath(config.getBotCertPath());
-        this.setBotCertName(config.getBotCertName());
-        this.setBotCertPassword(config.getBotCertPassword());
-        this.setBotEmailAddress(config.getBotEmailAddress());
-        this.setAppCertPath(config.getAppCertPath());
-        this.setAppCertName(config.getAppCertName());
-        this.setAppCertPassword(config.getAppCertPassword());
-        this.setProxyURL(config.getProxyURL());
-        this.setProxyUsername(config.getProxyUsername());
-        this.setProxyPassword(config.getProxyPassword());
-        this.setPodProxyURL(config.getPodProxyURL());
-        this.setPodProxyUsername(config.getPodProxyUsername());
-        this.setPodProxyPassword(config.getPodProxyPassword());
-        this.setKeyManagerProxyURL(config.getKeyManagerProxyURL());
-        this.setKeyManagerProxyUsername(config.getKeyManagerProxyUsername());
-        this.setKeyManagerProxyPassword(config.getKeyManagerProxyPassword());
-        this.setAuthTokenRefreshPeriod(config.getAuthTokenRefreshPeriod());
-        this.setTruststorePath(config.getTruststorePath());
-        this.setTruststorePassword(config.getTruststorePassword());
-        this.setBotUsername(config.getBotUsername());
-        this.setBotPrivateKeyName(config.getBotPrivateKeyName());
-        this.setBotPrivateKeyPath(config.getBotPrivateKeyPath());
-        this.setAppPrivateKeyName(config.getAppPrivateKeyName());
-        this.setAppPrivateKeyPath(config.getAppPrivateKeyPath());
-        this.setAppId(config.getAppId());
-        this.setDatafeedEventsThreadpoolSize(config.getDatafeedEventsThreadpoolSize());
-        this.setDatafeedEventsErrorTimeout(config.getDatafeedEventsErrorTimeout());
-        this.setAuthenticationFilterUrlPattern(config.getAuthenticationFilterUrlPattern());
-        this.setConnectionTimeout(config.getConnectionTimeout());
+        try {
+            BeanUtils.copyProperties(this, config);
+        } catch (IllegalAccessException | InvocationTargetException e) {
+            logger.error("Unable to copy properties from " + config + " to this.", e);
+        }
     }
 }

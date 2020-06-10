@@ -2,6 +2,7 @@ package model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import java.util.List;
+import java.util.Map;
 import utils.SymMessageParser;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -9,6 +10,7 @@ public class InboundMessage {
     private String messageId;
     private Long timestamp;
     private String message;
+    private InboundMessage sharedMessage;
     private String data;
     private List<Attachment> attachments;
     private User user;
@@ -17,6 +19,8 @@ public class InboundMessage {
     private String diagnostic;
     private String userAgent;
     private String originalFormat;
+    private String disclaimer;
+    private String sid;
 
     public String getMessageId() {
         return messageId;
@@ -40,6 +44,14 @@ public class InboundMessage {
 
     public void setMessage(String message) {
         this.message = message;
+    }
+
+    public InboundMessage getSharedMessage() {
+        return sharedMessage;
+    }
+
+    public void setSharedMessage(InboundMessage sharedMessage) {
+        this.sharedMessage = sharedMessage;
     }
 
     public String getData() {
@@ -106,6 +118,22 @@ public class InboundMessage {
         this.originalFormat = originalFormat;
     }
 
+    public String getDisclaimer() {
+        return disclaimer;
+    }
+
+    public void setDisclaimer(String disclaimer) {
+        this.disclaimer = disclaimer;
+    }
+
+    public String getSid() {
+        return sid;
+    }
+
+    public void setSid(String sid) {
+        this.sid = sid;
+    }
+
     public String getMessageText() {
         if (SymMessageParser.getInstance() == null) {
             return null;
@@ -123,5 +151,9 @@ public class InboundMessage {
 
     public List<Long> getMentions() {
         return SymMessageParser.getMentions(this);
+    }
+
+    public Map<String, String> getEmojis() {
+        return SymMessageParser.getEmojis(this);
     }
 }

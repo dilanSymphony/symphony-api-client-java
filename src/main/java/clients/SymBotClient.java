@@ -3,15 +3,27 @@ package clients;
 import authentication.ISymAuth;
 import authentication.SymBotAuth;
 import authentication.SymBotRSAAuth;
-import clients.symphony.api.*;
+import clients.symphony.api.AdminClient;
+import clients.symphony.api.ConnectionsClient;
+import clients.symphony.api.DatafeedClient;
+import clients.symphony.api.FirehoseClient;
+import clients.symphony.api.HealthcheckClient;
+import clients.symphony.api.InformationBarriersClient;
+import clients.symphony.api.MessagesClient;
+import clients.symphony.api.PresenceClient;
+import clients.symphony.api.SignalsClient;
+import clients.symphony.api.StreamsClient;
+import clients.symphony.api.UsersClient;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import configuration.LoadBalancingMethod;
 import configuration.SymConfig;
 import configuration.SymConfigLoader;
 import configuration.SymLoadBalancedConfig;
-import exceptions.NoConfigException;
-import exceptions.SymClientException;
-import javax.ws.rs.client.Client;
+import exceptions.AuthenticationException;
 import model.UserInfo;
+import org.apache.commons.codec.binary.Base64;
 import org.glassfish.jersey.client.ClientConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,6 +31,8 @@ import services.DatafeedEventsService;
 import services.FirehoseService;
 import utils.HttpClientBuilderHelper;
 import utils.SymMessageParser;
+
+import javax.ws.rs.client.Client;
 
 public final class SymBotClient implements ISymClient {
     private static final Logger logger = LoggerFactory.getLogger(SymBotClient.class);
@@ -42,32 +56,39 @@ public final class SymBotClient implements ISymClient {
     private HealthcheckClient healthcheckClient;
     private InformationBarriersClient informationBarriersClient;
 
-    public static SymBotClient initBotRsa(String configPath) throws NoConfigException {
+    public static SymBotClient initBotRsa(String configPath) throws Exception {
         return initBotRsa(configPath, SymConfig.class);
     }
 
-    public static <T extends SymConfig> SymBotClient initBotRsa(String configPath, Class<T> clazz) throws NoConfigException {
+    public static <T extends SymConfig> SymBotClient initBotRsa(String configPath, Class<T> clazz) throws Exception {
         return initBot(configPath, clazz, true);
     }
 
-    public static SymBotClient initBot(String configPath) throws NoConfigException {
+    public static SymBotClient initBot(String configPath) throws Exception {
         return initBot(configPath, SymConfig.class);
     }
 
-    public static <T extends SymConfig> SymBotClient initBot(String configPath, Class<T> clazz) throws NoConfigException {
+    public static <T extends SymConfig> SymBotClient initBot(String configPath, Class<T> clazz) throws Exception {
         return initBot(configPath, clazz, false);
     }
 
-    private static <T extends SymConfig> SymBotClient initBot(String configPath, Class<T> clazz, boolean isRsa)
-        throws NoConfigException {
-        if (botClient == null) {
-            T config = SymConfigLoader.loadConfig(configPath, clazz);
-            ISymAuth botAuth = isRsa ? new SymBotRSAAuth(config) : new SymBotAuth(config);
-            botAuth.authenticate();
-            botClient = new SymBotClient(config, botAuth);
+    private static <T extends SymConfig> SymBotClient initBot(String configPath, Class<T> clazz, boolean isRsa) throws Exception {
+        if (botClient != null) {
+            return botClient;
         }
+        T config = SymConfigLoader.loadConfig(configPath, clazz);
+        ISymAuth botAuth = isRsa ? new SymBotRSAAuth(config) : new SymBotAuth(config);
 
-        return botClient;
+        try {
+            botAuth.authenticate();
+        } catch (AuthenticationException e) {
+            if(e.hasRootException()) {
+                throw e.getRootException();
+            } else {
+                throw e;
+            }
+        }
+        return new SymBotClient(config, botAuth);
     }
 
     public static SymBotClient initBot(SymConfig config, ISymAuth botAuth) {
@@ -113,34 +134,38 @@ public final class SymBotClient implements ISymClient {
         return botClient;
     }
 
-    public static SymBotClient initBotLoadBalancedRsa(String configPath, String lbConfigPath) throws NoConfigException {
+    public static SymBotClient initBotLoadBalancedRsa(String configPath, String lbConfigPath) throws Exception {
         return initBotLoadBalancedRsa(configPath, lbConfigPath, SymConfig.class);
     }
 
     public static <T extends SymConfig> SymBotClient initBotLoadBalancedRsa(
         String configPath, String lbConfigPath, Class<T> clazz
-    ) throws NoConfigException {
+    ) throws Exception {
         return initBotLoadBalanced(configPath, lbConfigPath, clazz, true);
     }
 
-    public static SymBotClient initBotLoadBalanced(String configPath, String lbConfigPath) throws NoConfigException {
+    public static SymBotClient initBotLoadBalanced(String configPath, String lbConfigPath) throws Exception {
         return initBotLoadBalanced(configPath, lbConfigPath, SymConfig.class);
     }
 
     public static <T extends SymConfig> SymBotClient initBotLoadBalanced(
         String configPath, String lbConfigPath, Class<T> clazz
-    ) throws NoConfigException {
+    ) throws Exception {
         return initBotLoadBalanced(configPath, lbConfigPath, clazz, false);
     }
 
     private static <T extends SymConfig> SymBotClient initBotLoadBalanced(
         String configPath, String lbConfigPath, Class<T> clazz, boolean isRsa
-    ) throws NoConfigException {
+    ) throws Exception {
         if (botClient == null) {
             T config = SymConfigLoader.loadConfig(configPath, clazz);
             SymLoadBalancedConfig lbConfig = SymConfigLoader.loadConfig(lbConfigPath, SymLoadBalancedConfig.class);
             ISymAuth botAuth = isRsa ? new SymBotRSAAuth(config) : new SymBotAuth(config);
-            botAuth.authenticate();
+            try {
+                botAuth.authenticate();
+            } catch (AuthenticationException e) {
+                throw e.getRootException();
+            }
 
             lbConfig.cloneAttributes(config);
             botClient = new SymBotClient(lbConfig, botAuth);
@@ -157,15 +182,16 @@ public final class SymBotClient implements ISymClient {
 
         this.podClient = HttpClientBuilderHelper.getHttpClientBuilderWithTruststore(config).withConfig(podConfig).build();
         this.agentClient = HttpClientBuilderHelper.getHttpClientBuilderWithTruststore(config).withConfig(agentConfig).build();
-
-        try {
-            botUserInfo = this.getUsersClient().getSessionUser();
-        }  catch (SymClientException e) {
-            logger.error("Error getting sessionUser ", e);
+        
+        this.botUserInfo = parseUserFromSessionToken(symBotAuth.getSessionToken());
+        
+        if (this.botUserInfo == null) {
+            logger.debug("Calling getSessionUser to get bot info.");
+            getBotUserInfo();
         }
-
+        
         SymMessageParser.createInstance(this);
-
+        
         reportIfLoadBalanced(config);
     }
 
@@ -177,15 +203,32 @@ public final class SymBotClient implements ISymClient {
         this.agentClient = HttpClientBuilderHelper.getHttpClientBuilderWithTruststore(config)
             .withConfig(agentClientConfig).build();
 
-        try {
-            botUserInfo = this.getUsersClient().getSessionUser();
-        } catch (SymClientException e) {
-            logger.error("Error getting sessionUser ", e);
-        }
+        this.botUserInfo = parseUserFromSessionToken(symBotAuth.getSessionToken());
 
+        if (this.botUserInfo == null) {
+            logger.debug("Calling getSessionUser to get bot info.");
+            getBotUserInfo();
+        }
+        
         SymMessageParser.createInstance(this);
 
         reportIfLoadBalanced(config);
+    }
+
+    private UserInfo parseUserFromSessionToken(String sessionToken) {
+        try {
+            String userToken = sessionToken.split("\\.")[1];
+            String decodedUserToken = new String(Base64.decodeBase64(userToken.getBytes()));
+            JsonNode jsonNode = (new ObjectMapper()).readTree(decodedUserToken);
+            UserInfo user = new UserInfo();
+            user.setUsername(jsonNode.path("sub").asText());
+            user.setId(jsonNode.path("userId").asLong());
+            logger.info("Authenticated as {} ({})", user.getUsername(), user.getId());
+            return user;
+        } catch (JsonProcessingException | ArrayIndexOutOfBoundsException e) {
+            logger.error("Unable to parse user info");
+            return null;
+        }
     }
 
     private void reportIfLoadBalanced(SymConfig config) {
@@ -200,7 +243,25 @@ public final class SymBotClient implements ISymClient {
     }
 
     public UserInfo getBotUserInfo() {
+        // botUserInfo is incomplete if getEmailAddress is null as we only parsed in username and id from JWT
+        if (botUserInfo == null || botUserInfo.getEmailAddress() == null) {
+            botUserInfo = this.getUsersClient().getSessionUser();
+        }
         return botUserInfo;
+    }
+    
+    public String getBotUsername() {
+        if (botUserInfo == null || botUserInfo.getUsername() == null) {
+            getBotUserInfo();
+        }
+        return botUserInfo.getUsername();
+    }
+    
+    public long getBotUserId() {
+        if (botUserInfo == null || botUserInfo.getId() == null) {
+            getBotUserInfo();
+        }
+        return botUserInfo.getId();
     }
 
     public DatafeedClient getDatafeedClient() {

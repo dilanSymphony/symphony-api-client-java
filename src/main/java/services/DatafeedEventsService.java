@@ -2,15 +2,21 @@ package services;
 
 import clients.SymBotClient;
 import clients.symphony.api.DatafeedClient;
+import configuration.LoadBalancingMethod;
 import configuration.SymConfig;
 import configuration.SymLoadBalancedConfig;
-import exceptions.SymClientException;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import javax.ws.rs.ProcessingException;
+
 import listeners.*;
 import model.DatafeedEvent;
 import model.events.MessageSent;
@@ -18,7 +24,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class DatafeedEventsService {
+
     private final Logger logger = LoggerFactory.getLogger(DatafeedEventsService.class);
+
+    private static final int MAX_BACKOFF_TIME = 5 * 60; // five minutes
+
     private SymBotClient botClient;
     private DatafeedClient datafeedClient;
     private List<RoomListener> roomListeners;
@@ -44,11 +54,39 @@ public class DatafeedEventsService {
         THREADPOOL_SIZE = threadPoolSize > 0 ? threadPoolSize : 5;
         resetTimeout();
 
+        // if the reuseDatafeedID config isn't set (null), we assume its default value as true
+        if (botClient.getConfig().getReuseDatafeedID() == null || this.botClient.getConfig().getReuseDatafeedID()) {
+            try {
+                File file = new File("." + File.separator + "datafeed.id");
+                if (file.isDirectory()) {
+                    file = new File("." + File.separator + "datafeed.id" + File.separator + "datafeed.id");
+                }
+                Path datafeedIdPath = Paths.get(file.getPath());
+                String[] persistedDatafeed = Files.readAllLines(datafeedIdPath).get(0).split("@");
+                datafeedId = persistedDatafeed[0];
+
+                if (client.getConfig() instanceof SymLoadBalancedConfig) {
+                    SymLoadBalancedConfig lbConfig = (SymLoadBalancedConfig) client.getConfig();
+                    String[] agentHostPort = persistedDatafeed[1].split(":");
+                    if (lbConfig.getLoadBalancing().getMethod() == LoadBalancingMethod.external) {
+                        lbConfig.setActualAgentHost(agentHostPort[0]);
+                    } else {
+                        int previousIndex = lbConfig.getAgentServers().indexOf(agentHostPort[0]);
+                        lbConfig.setCurrentAgentIndex(previousIndex);
+                    }
+                }
+
+                logger.info("Using previous datafeed id: {}", datafeedId);
+            } catch (IOException e) {
+                logger.info("No previous datafeed id file");
+            }
+        }
+
         while (datafeedId == null) {
             try {
                 datafeedId = datafeedClient.createDatafeed();
                 resetTimeout();
-            } catch (ProcessingException e) {
+            } catch (Exception e) {
                 handleError(e);
             }
         }
@@ -184,10 +222,11 @@ public class DatafeedEventsService {
         } else if (errMsg.contains("Could not find a datafeed with the")) {
             logger.error(errMsg);
         } else {
-            logger.error("HandlerError error", e);
+            logger.error("An unknown error happened, type : " + e.getClass(), e);
         }
-        logger.info("Sleeping for {} seconds before retrying..", TIMEOUT_NO_OF_SECS);
+
         sleep();
+
         try {
             SymConfig config = botClient.getConfig();
             if (config instanceof SymLoadBalancedConfig) {
@@ -195,7 +234,7 @@ public class DatafeedEventsService {
             }
             datafeedId = datafeedClient.createDatafeed();
             resetTimeout();
-        } catch (SymClientException e1) {
+        } catch (Exception e1) {
             sleep();
             handleError(e);
         }
@@ -203,8 +242,15 @@ public class DatafeedEventsService {
 
     private void sleep() {
         try {
+            logger.info("Sleeping for {} seconds before retrying..", TIMEOUT_NO_OF_SECS);
             TimeUnit.SECONDS.sleep(TIMEOUT_NO_OF_SECS);
-            TIMEOUT_NO_OF_SECS *= 2;
+
+            // exponential backoff until we reach the MAX_BACKOFF_TIME (5 minutes)
+            if (TIMEOUT_NO_OF_SECS * 2 <= MAX_BACKOFF_TIME) {
+                TIMEOUT_NO_OF_SECS *= 2;
+            } else {
+                TIMEOUT_NO_OF_SECS = MAX_BACKOFF_TIME;
+            }
         } catch (InterruptedException ie) {
             logger.error("Error trying to sleep ", ie);
         }
@@ -212,7 +258,7 @@ public class DatafeedEventsService {
 
     private void handleEvents(List<DatafeedEvent> datafeedEvents) {
         for (DatafeedEvent event : datafeedEvents) {
-            if (event == null || event.getInitiator().getUser().getUserId().equals(botClient.getBotUserInfo().getId())) {
+            if (event == null || event.getInitiator().getUser().getUserId().equals(botClient.getBotUserId())) {
                 continue;
             }
 

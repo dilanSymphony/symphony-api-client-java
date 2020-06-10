@@ -12,13 +12,13 @@ authentication, data feed / firehose event loops, message parsing and agent serv
 <dependency>
     <groupId>com.symphony.platformsolutions</groupId>
     <artifactId>symphony-api-client-java</artifactId>
-    <version>[1.0.0,)</version>
+    <version>[1.1.0,)</version>
 </dependency>
 ```
 
 ### Gradle
 ```groovy
-compile: 'com.symphony.platformsolutions:symphony-api-client-java:1.0.+'
+compile: 'com.symphony.platformsolutions:symphony-api-client-java:1.1.+'
 ```
 
 ## Installation via Bot Generator
@@ -94,9 +94,21 @@ can exclude the bot certificate section, all extension app sections and all opti
     // Optional: To modify the default datafeed handling properties
     "datafeedEventsThreadpoolSize": 5,
     "datafeedEventsErrorTimeout": 30,
+    "reuseDatafeedID": true,
     
     // Optional: Request filter pattern to verify JWT
     "authenticationFilterUrlPattern": "/v1/",
+    
+    // Optional: If custom URI schemes need to be supported by MessageML parser 
+                 By setting this property, the default schemes (http and https) will be overridden
+    "supportedUriSchemes": ["http", "https", "customScheme"],
+  
+    // Optional/experimental: exponential backoff configuration for retries
+    "retry": {
+        "maxAttempts": 10,
+        "initialIntervalMillis": 500,
+        "multiplier": 1.5
+    }
 }
 ```
 
